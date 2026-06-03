@@ -1,0 +1,128 @@
+# github-flow-deploy-steps.tmp.yml
+#
+# Reusable deploy steps for GitHub Flow Docker pipeline.
+# Called by DEPLOY_DEV, DEPLOY_TEST, and DEPLOY_PROD stages.
+# Pass slot: 'canary' for production canary deployments; leave empty for normal deploys.
+
+parameters:
+- name: envName
+  type: string
+
+- name: envFilesDir
+  type: string
+  default: ''
+
+- name: projectName
+  type: string
+
+- name: dockerRegistry
+  type: string
+  default: 'taxes.jfrog.io'
+
+- name: dockerRepo
+  type: string
+  default: 'taxes-docker'
+
+- name: serviceConnection
+  type: string
+
+- name: slot
+  type: string
+  default: ''
+
+steps:
+- checkout: self
+  sparseCheckoutDirectories: ${{ parameters.envFilesDir }}
+
+- checkout: templates
+  sparseCheckoutDirectories: ./AzureDevOps/py-scripts
+
+- ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+    - task: Bash@3
+      displayName: 'Update Build Number'
+      inputs:
+        targetType: inline
+        script: |
+          echo "##vso[build.updatebuildnumber]$(Build.SourceBranchName)"
+
+- script: |
+    python3 "$(Build.SourcesDirectory)/DevOps/AzureDevOps/py-scripts/dot-env-to-json.py"
+  env:
+    DOT_ENV_FILE_PATH: "$(Build.SourcesDirectory)/$(Build.Repository.Name)/${{ parameters.envFilesDir }}/.env.${{ parameters.envName }}"
+    JSON_OUTPUT_FILE_PATH: "$(Build.ArtifactStagingDirectory)/$(Build.BuildNumber).json"
+  displayName: 'Convert .env.${{ parameters.envName }} to JSON'
+
+- task: AzureCLI@2
+  displayName: 'Update AppService Settings'
+  inputs:
+    azureSubscription: ${{ parameters.serviceConnection }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      SLOT="${{ parameters.slot }}"
+      SLOT_ARG=${SLOT:+--slot "$SLOT"}
+      if [[ -f "$1" ]]; then
+        az webapp config appsettings set \
+          --name "$(azure_resource_name)" \
+          --resource-group "$(azure_resource_group_name)" \
+          --settings "@$1" \
+          $SLOT_ARG
+      else
+        echo "##vso[task.logissue type=warning]$1 not found – settings update skipped"
+      fi
+    arguments: '$(Build.ArtifactStagingDirectory)/$(Build.BuildNumber).json'
+
+- task: AzureCLI@2
+  displayName: 'Deploy Container'
+  inputs:
+    azureSubscription: ${{ parameters.serviceConnection }}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      SLOT="${{ parameters.slot }}"
+      SLOT_ARG=${SLOT:+--slot "$SLOT"}
+      az webapp config container set \
+        --name "$(azure_resource_name)" \
+        --resource-group "$(azure_resource_group_name)" \
+        --docker-custom-image-name "${{ parameters.dockerRegistry }}/${{ parameters.dockerRepo }}/$(Build.Repository.Name)/${{ lower(parameters.projectName) }}:$(Build.BuildNumber)" \
+        $SLOT_ARG
+      echo "Image Ref:"
+      echo "${{ parameters.dockerRegistry }}/${{ parameters.dockerRepo }}/$(Build.Repository.Name)/${{ lower(parameters.projectName) }}:$(Build.BuildNumber)"
+
+- script: |
+    set -e
+    VERSION="$(Build.BuildNumber)"
+    ENV_TAG="${{ parameters.projectName }}-${{ parameters.envName }}"
+
+    # inject token into remote URL
+    REPO_URL=$(git remote get-url origin)
+    AUTH_URL=$(echo "$REPO_URL" | sed 's|https://|https://x-token:'"$SYSTEM_ACCESSTOKEN"'@|')
+    git remote set-url origin "$AUTH_URL"
+
+    git fetch --tags --quiet
+    git config user.email "DevOpsTeam@taxes.co.il"
+    git config user.name  "DevOps Team"
+
+    if git ls-remote --tags origin "refs/tags/$ENV_TAG" | grep -q .; then
+      echo "Tag $ENV_TAG exists – force-updating"
+      git tag -fa "$ENV_TAG" -m "[build $(Build.BuildId)] $(Build.SourceVersionMessage)"
+      git push origin "refs/tags/$ENV_TAG" --force
+    else
+      git tag -a "$ENV_TAG" -m "[build $(Build.BuildId)] $(Build.SourceVersionMessage)"
+      git push origin "$ENV_TAG"
+      echo "Created tag $ENV_TAG"
+    fi
+  displayName: 'Git Tagging ${{ parameters.projectName }}-${{ parameters.envName }}'
+  workingDirectory: $(Build.SourcesDirectory)/$(Build.Repository.Name)
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+# - task: AzureAppServiceSettings@1
+#   displayName: 'Set Build Version Tag'
+#   inputs:
+#     ConnectedServiceName: ${{ parameters.serviceConnection }}
+#     appName: $(azure_resource_name)
+#     resourceGroupName: $(azure_resource_group_name)
+#     ${{ if ne(parameters.slot, '') }}:
+#       slotName: ${{ parameters.slot }}
+#     appSettings: |
+#       [{"name": "taxes_WEBSITE_VERSION", "value": "$(Build.BuildNumber)", "slotSetting": "false"}]
