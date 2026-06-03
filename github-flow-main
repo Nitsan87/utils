@@ -1,0 +1,538 @@
+parameters:
+- name: projectName
+  type: string
+
+- name: customEnvironment
+  type: string
+  default: ''
+
+- name: dockerfilePath
+  type: string
+  default: 'Dockerfile'
+
+- name: dockerBuildArgs
+  type: string
+  default: ''
+
+- name: envFilesDir
+  type: string
+  default: ''
+
+- name: dockerRegistry
+  type: string
+  default: 'taxes.jfrog.io'
+
+- name: dockerRepo
+  type: string
+  default: 'taxes-docker'
+
+- name: dockerRepoDevLocal
+  type: string
+  default: 'docker-local-dev'
+
+- name: dockerRepoTestLocal
+  type: string
+  default: 'docker-local-test'
+
+- name: dockerRepoProdLocal
+  type: string
+  default: 'docker-local-prod'
+
+- name: gitFetchDepth
+  type: string
+  default: '0'
+
+stages:
+- ${{ if not(startsWith(variables['Build.SourceBranch'], 'refs/tags/')) }}:
+  - stage: CI_BUILD
+    displayName: '🛠 Build & Scan'
+    dependsOn: []
+    variables:
+      - template: /environments/global-variables.tmp.yml
+        parameters:
+          projectName: ${{ parameters.projectName }}
+          stackType: docker
+          envName: dev
+      - template: /environments/${{ variables['Build.Repository.Name'] }}/${{ variables['default-variable-template-name'] }}
+      - template: /environments/${{ variables['Build.Repository.Name'] }}/${{ variables['env-variable-template-name'] }}
+      - group: devops
+      - name: JFROG_CLI_LOG_LEVEL
+        value: DEBUG
+      - name: imageBase
+        value: '${{ parameters.dockerRepoDevLocal }}/$(Build.Repository.Name)/${{ lower(parameters.projectName) }}'
+
+    jobs:
+    - ${{ if and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'IndividualCI')) }}:
+      - job: ReserveVersion
+        displayName: '🏷 Compute & Reserve Version'
+        pool:
+          name: Docker-DevTest
+          demands:
+            - AZP_AGENT_NAME -equals git-agent-1
+
+        steps:
+        - checkout: self
+          fetchDepth: 0
+          persistCredentials: true
+
+        - task: Bash@3
+          name: SetVersion
+          displayName: 'Compute next version'
+          inputs:
+            targetType: inline
+            script: |
+              git fetch --tags --quiet
+
+              CURRENT_COMMIT=$(git rev-parse HEAD)
+
+              # Check if current commit already has a semver tag
+              EXISTING_TAG=$(git tag --list 'v*.*.*' --points-at HEAD --sort=-v:refname | head -1)
+
+              if [ -n "$EXISTING_TAG" ]; then
+                version="${EXISTING_TAG#v}"
+                echo "Commit $CURRENT_COMMIT is already tagged as $EXISTING_TAG – reusing, no bump"
+                echo "##vso[task.setvariable variable=version;isOutput=true]$version"
+                echo "##vso[build.updatebuildnumber]$EXISTING_TAG"
+                exit 0
+              fi
+
+              # No existing tag on this commit – proceed with bump logic
+              latest=$(git tag --list 'v*.*.*' --sort=-v:refname | head -1)
+              [ -z "$latest" ] && latest='v0.0.0'
+              version_str=${latest#v}
+              major=$(echo "$version_str" | cut -d. -f1)
+              minor=$(echo "$version_str" | cut -d. -f2)
+              patch=$(echo "$version_str" | cut -d. -f3)
+
+              msg=$(git log -1 --pretty=%B)
+              msg_header=$(echo "$msg" | head -1)
+
+              # ── Detect bump type per Conventional Commits + versioning guide ──────
+
+              IS_BREAKING=false
+              IS_FEAT=false
+
+              # Breaking change: ! after type or type(scope)  →  e.g. feat!: / feat(auth)!:
+              # No ^ anchor so it matches "Merged PR 1234: feat(scope)!: ..."
+              if echo "$msg_header" | grep -qE '(feat|feature|[a-z]+)(\([^)]*\))?!:'; then
+                IS_BREAKING=true
+              fi
+
+              # Breaking change: major: shorthand prefix (repo-specific)
+              if echo "$msg_header" | grep -iqE '(^|:\s*)major:'; then
+                IS_BREAKING=true
+              fi
+
+
+              # Breaking change: BREAKING CHANGE: footer (search full message body)
+              if echo "$msg" | grep -qE 'BREAKING CHANGE:'; then
+                IS_BREAKING=true
+              fi
+
+              # Minor bump: feat/feature type  →  feat: / feat(scope): / feature: / feature(scope):
+              # [^!]? is optional so it matches when ) is immediately followed by :
+              # Excludes feat!: / feature!: which are already caught as breaking above
+              # No ^ anchor so it matches "Merged PR 1234: feat(scope): ..."
+              if echo "$msg_header" | grep -qE '(feat|feature)(\([^)]*\))?[^!]?:'; then
+                IS_FEAT=true
+              fi
+
+              # ── Determine bump, respecting 0.x rule ───────────────────────────────
+              # In 0.x: breaking change bumps MINOR (not MAJOR) until 1.0.0 is declared
+              bump='patch'
+              if [ "$IS_BREAKING" = true ]; then
+                if [ "$major" -eq 0 ]; then
+                  bump='minor'   # 0.x: breaking → minor per SemVer 0.x convention
+                else
+                  bump='major'
+                fi
+              elif [ "$IS_FEAT" = true ]; then
+                bump='minor'
+              fi
+
+              case "$bump" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                *)     patch=$((patch + 1)) ;;
+              esac
+
+              version="$major.$minor.$patch"
+              echo "Latest tag  : $latest"
+              echo "Commit msg  : $msg_header"
+              echo "Breaking    : $IS_BREAKING"
+              echo "Feat        : $IS_FEAT"
+              echo "Bump        : $bump"
+              echo "Next version: v$version"
+              echo "##vso[task.setvariable variable=version;isOutput=true]$version"
+              echo "##vso[build.updatebuildnumber]v$version"
+
+        - task: Bash@3
+          displayName: 'Reserve git tag $(Build.BuildNumber)'
+          inputs:
+            targetType: inline
+            script: |
+              set -e
+              VERSION="$(Build.BuildNumber)"
+              if ! echo "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo "##vso[task.logissue type=error]Build.BuildNumber '$VERSION' is not semver – was SetVersion skipped?"
+                exit 1
+              fi
+
+              git fetch --tags --quiet
+
+              # Check if this exact commit is already tagged with this version
+              EXISTING_TAG=$(git tag --list "$VERSION" --points-at HEAD)
+              if [ -n "$EXISTING_TAG" ]; then
+                echo "Tag $VERSION already points to current commit – nothing to do"
+                exit 0
+              fi
+
+              if git ls-remote --tags origin "refs/tags/$VERSION" | grep -q .; then
+                echo "##vso[task.logissue type=warning]Tag $VERSION exists on a DIFFERENT commit – investigate!"
+                exit 1
+              fi
+
+              git config user.email "DevOpsTeam@taxes.co.il"
+              git config user.name  "DevOps Team"
+              git tag -a "$VERSION" -m "[build $(Build.BuildId)] $(Build.SourceVersionMessage)"
+              git push origin "$VERSION"
+              echo "Reserved tag $VERSION"
+
+    - job: BuildScanPush
+      ${{ if and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'IndividualCI')) }}:
+        dependsOn: ReserveVersion
+        displayName: 'Build ▸ Scan ▸ Push'
+      ${{ else }}:
+        displayName: 'Build ▸ Scan'
+        dependsOn: []
+      timeoutInMinutes: 90
+      pool:
+        name: Docker-DevTest
+        demands:
+          - DOCKER_IN_DOCKER
+
+      steps:
+      - checkout: templates
+        path: devops
+
+      - checkout: self
+        path: s
+        fetchDepth: ${{ parameters.gitFetchDepth }}
+        persistCredentials: true
+
+      - task: Bash@3
+        displayName: 'Rename .env File'
+        inputs:
+          targetType: inline
+          script: |
+            SRC="$(Build.SourcesDirectory)/.env.pipeline"
+            DST="$(Build.SourcesDirectory)/.env.local"
+            if [ -f "$SRC" ]; then
+              cp "$SRC" "$DST" && echo "Copied $SRC → $DST"
+            else
+              echo "##vso[task.logissue type=warning]$SRC not found – skipped"
+            fi
+
+      - template: set-private-registries.tmp.yml@templates
+
+      - task: replacetokens@5
+        displayName: 'Replace Env Tokens'
+        inputs:
+          targetFiles: >
+            $(Build.SourcesDirectory)/pip.conf;
+            $(Build.SourcesDirectory)/sources.list;
+            $(Build.SourcesDirectory)/.env.local;
+            $(Build.SourcesDirectory)/repositories;
+            $(Build.SourcesDirectory)/.npmrc;
+            $(Build.SourcesDirectory)/nuget.config
+          encoding: auto
+          tokenPattern: default
+          writeBOM: true
+          actionOnMissing: warn
+          keepToken: false
+          actionOnNoFiles: continue
+          enableTransforms: false
+          enableRecursion: false
+          useLegacyPattern: false
+          enableTelemetry: true
+
+      - task: Docker@2
+        displayName: 'Docker Build'
+        timeoutInMinutes: 90
+        inputs:
+          containerRegistry: 'taxes-Jfrog-Docker-Registry'
+          repository: '$(imageBase)'
+          command: build
+          Dockerfile: ${{ parameters.dockerfilePath }}
+          arguments: ${{ parameters.dockerBuildArgs }}
+          tags: |
+            $(Build.BuildNumber)
+            latest
+
+      - task: JFrogDocker@1
+        displayName: 'Docker JFrog Scan'
+        inputs:
+          command: Scan
+          xrayConnection: 'taxes-Jfrog-Xray'
+          imageName: '${{ parameters.dockerRegistry }}/$(imageBase):$(Build.BuildNumber)'
+          watchesSource: watches
+          watches: docker-min-high
+          allowFailBuild: true
+          threads: '3'
+          skipLogin: false
+
+      - task: Docker@2
+        displayName: 'Docker Push → dev-local'
+        condition: |
+          and(
+            succeeded(),
+            eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+            eq(variables['Build.Reason'], 'IndividualCI')
+          )
+        inputs:
+          containerRegistry: 'taxes-Jfrog-Docker-Registry'
+          repository: '$(imageBase)'
+          command: push
+          tags: |
+            $(Build.BuildNumber)
+            latest
+
+      - template: docker-retention.tmp.yml@templates
+        parameters:
+          appName: ${{ parameters.projectName }}
+          RepoName: ${{ parameters.dockerRepo }}
+          dockerRepo: taxes-docker-local
+          taxesEnv: dev
+          retentionLimit: 10
+
+      - script: |
+          docker system prune --force --all \
+            --filter="label=com.visualstudio.taxes.image.build.definitionname=$(Build.DefinitionName)" \
+            --filter="label!=com.visualstudio.taxes.image.build.builduri=$(Build.BuildUri)"
+        displayName: 'Clean docker cache'
+      
+    - ${{ if or(and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'IndividualCI')),startsWith(variables['Build.SourceBranch'], 'refs/tags/')) }}:
+      - job: xray_audit
+        displayName: 'Xray Auditing'
+        dependsOn: []
+        timeoutInMinutes: 10
+        pool:
+          name: vmss-devtest-agents
+          demands:
+            - JFROG_CLI
+        steps:  
+        - script: |
+            jf config add artifactory \
+              --url=https://${{ parameters.dockerRegistry }} \
+              --access-token=$(JFROG_ADMIN_TOKEN) \
+              --user=azure-devops \
+              --overwrite=true \
+              --interactive=false
+            
+            jf audit --npm --min-severity=High --exclusions="*.git*;*node_modules*;*target*;*venv*;*test*;*.claude*;*.agents*"
+          displayName: 'JFrog Xray Audit (pre-build)'
+          workingDirectory: '$(Build.SourcesDirectory)'
+
+- ${{ if or(and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'IndividualCI')),startsWith(variables['Build.SourceBranch'], 'refs/tags/')) }}:
+  - stage: DEPLOY_DEV
+    displayName: '🚀 Dev Deployment'
+    ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+      dependsOn: []
+    ${{ else }}:
+      dependsOn: CI_BUILD
+    variables:
+      - name: azure_resource_group_name
+        value: 'rg-$(Build.Repository.Name)-digital-dev'
+      - name: azure_connected_service_name
+        value: 'sp-rg-$(Build.Repository.Name)-digital-dev-contributor'
+      - name: azure_resource_name
+        value: 'app-$(Build.Repository.Name)-${{ lower(parameters.projectName) }}-dev'
+      - name: azure_resource_type
+        value: 'webAppContainer'
+      - name: serviceConnection
+        value: sp-rg-$(Build.Repository.Name)-digital-dev-contributor
+    jobs:
+    - deployment: DeployDev
+      displayName: 'Deploy to Dev'
+      pool:
+        name: WebtaxesDevTest
+      environment: '${{ parameters.customEnvironment }}dev'
+      workspace:
+        clean: all
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - template: github-flow-deploy-steps.tmp.yml@templates
+              parameters:
+                envName: dev
+                envFilesDir: ${{ parameters.envFilesDir }}
+                projectName: ${{ parameters.projectName }}
+                dockerRegistry: ${{ parameters.dockerRegistry }}
+                dockerRepo: ${{ parameters.dockerRepoDevLocal }}
+                serviceConnection: ${{ variables.serviceConnection }}
+  - ${{ if not(eq(variables['Build.Repository.Name'], 'githubflow-smart-hospital')) }}:
+    - stage: DEPLOY_TEST
+      displayName: '🚀 Test Deployment'
+      dependsOn: DEPLOY_DEV
+      condition: succeeded()
+      variables:
+        - name: azure_resource_group_name
+          value: 'rg-$(Build.Repository.Name)-digital-test'
+        - name: azure_connected_service_name
+          value: 'sp-rg-$(Build.Repository.Name)-digital-test-contributor'
+        - name: azure_resource_name
+          value: 'app-$(Build.Repository.Name)-${{ lower(parameters.projectName) }}-test'
+        - name: azure_resource_type
+          value: 'webAppContainer'
+        - name: serviceConnection
+          value: sp-rg-$(Build.Repository.Name)-digital-test-contributor
+
+      jobs:
+      - job: PromoteToTest
+        displayName: 'JFrog copy dev-local → test-local'
+        variables:
+          - group: devops
+        pool:
+          name: Docker-DevTest
+          demands:
+            - DOCKER_IN_DOCKER
+        steps:
+        - task: AzureKeyVault@2
+          displayName: Get retention PAT
+          inputs:
+            azureSubscription: 'devops-azure-taxes-kv'
+            KeyVaultName: 'taxes-KV'
+            SecretsFilter: 'JFROG-RETENTION-PAT'
+            RunAsPreJob: false
+
+        - task: Bash@3
+          displayName: 'Promote image to test-local'
+          inputs:
+            targetType: inline
+            script: |
+              set -e
+              IMAGE_PATH=$(Build.Repository.Name)/${{ lower(parameters.projectName) }}/$(Build.BuildNumber)
+              jf rt copy \
+                "${{ parameters.dockerRepoDevLocal }}/${IMAGE_PATH}/*" \
+                "${{ parameters.dockerRepoTestLocal }}" \
+                --server-id=artifactory
+              echo "Promoted: ${{ parameters.dockerRepoDevLocal }}/$IMAGE_PATH → ${{ parameters.dockerRepoTestLocal }}/$IMAGE_PATH"
+
+      - deployment: DeployTest
+        displayName: 'Deploy to Test'
+        dependsOn: PromoteToTest
+        pool:
+          name: WebtaxesDevTest
+        environment: '${{ parameters.customEnvironment }}test'
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: github-flow-deploy-steps.tmp.yml@templates
+                parameters:
+                  envName: test
+                  envFilesDir: ${{ parameters.envFilesDir }}
+                  projectName: ${{ parameters.projectName }}
+                  dockerRegistry: ${{ parameters.dockerRegistry }}
+                  dockerRepo: ${{ parameters.dockerRepoTestLocal }}
+                  serviceConnection: ${{ variables.serviceConnection }}
+
+      
+    - stage: DEPLOY_PROD
+      displayName: '🚀 Prod Deployment (Canary)'
+      dependsOn: DEPLOY_TEST
+      condition: succeeded()
+      variables:
+        - name: azure_resource_group_name
+          value: 'rg-$(Build.Repository.Name)-digital-prod'
+        - name: azure_connected_service_name
+          value: 'sp-rg-$(Build.Repository.Name)-digital-prod-contributor'
+        - name: azure_resource_name
+          value: 'app-$(Build.Repository.Name)-${{ lower(parameters.projectName) }}-prod'
+        - name: azure_resource_type
+          value: 'webAppContainer'
+        - name: serviceConnection
+          value: sp-rg-$(Build.Repository.Name)-digital-prod-contributor
+
+      jobs:
+      - job: PromoteToProd
+        displayName: 'JFrog copy test-local → prod-local'
+        variables:
+          - group: devops
+        pool:
+          name: Docker-DevTest
+          demands:
+            - DOCKER_IN_DOCKER
+        steps:
+        - task: AzureKeyVault@2
+          displayName: 'Get JFrog PAT'
+          inputs:
+            azureSubscription: 'devops-azure-taxes-kv'
+            KeyVaultName: 'taxes-KV'
+            SecretsFilter: 'JFROG-RETENTION-PAT'
+            RunAsPreJob: false
+
+        - task: Bash@3
+          displayName: 'Promote image to prod-local'
+          inputs:
+            targetType: inline
+            script: |
+              set -e
+              IMAGE_PATH=$(Build.Repository.Name)/${{ lower(parameters.projectName) }}/$(Build.BuildNumber)
+              jf rt copy \
+                "${{ parameters.dockerRepoTestLocal }}/${IMAGE_PATH}/*" \
+                "${{ parameters.dockerRepoProdLocal }}" \
+                --server-id=artifactory
+              echo "Promoted: ${{ parameters.dockerRepoTestLocal }}/$IMAGE_PATH → ${{ parameters.dockerRepoProdLocal }}/$IMAGE_PATH"
+
+      - deployment: DeployProdCanary
+        displayName: 'Deploy to Canary'
+        dependsOn: PromoteToProd
+        pool:
+          name: WebtaxesProd
+        environment: '${{ parameters.customEnvironment }}prod'   # ← add Approval check here in UI
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: github-flow-deploy-steps.tmp.yml@templates
+                parameters:
+                  envName: prod
+                  envFilesDir: ${{ parameters.envFilesDir }}
+                  projectName: ${{ parameters.projectName }}
+                  dockerRegistry: ${{ parameters.dockerRegistry }}
+                  dockerRepo: ${{ parameters.dockerRepoProdLocal }}
+                  serviceConnection: ${{ variables.serviceConnection }}
+                  slot: canary
+
+      - job: SwapToProdApproval
+        displayName: 'Approve Canary → Prod Swap'
+        dependsOn: DeployProdCanary
+        pool: server
+        steps:
+        - task: ManualValidation@0
+          displayName: 'Approve swap canary → production'
+          timeoutInMinutes: 1440
+          inputs:
+            instructions: 'Canary slot is live with v$(version). Validate and approve to swap to production.'
+
+      - job: SwapToProd
+        displayName: 'Swap Canary → Prod'
+        dependsOn: SwapToProdApproval
+        pool:
+          name: WebtaxesProd
+        steps:
+        - task: AzureAppServiceManage@0
+          displayName: 'Swap slots'
+          inputs:
+            ConnectedServiceName: ${{ variables.serviceConnection }}
+            Action: 'Swap Slots'
+            WebAppName: $(azure_resource_name)
+            ResourceGroupName: $(azure_resource_group_name)
+            SourceSlot: 'canary'
+            PreserveVnet: false
